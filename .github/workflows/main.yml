@@ -1,0 +1,94 @@
+name: Build NDK for AArch64 Linux Host
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    env:
+      LLVM_SOURCE_ROOT: ${{ github.workspace }}/llvm_src
+      CUSTOM_CONFIG_DIR: ${{ github.workspace }}/custom_config
+
+    steps:
+    # 第一步：检出你的配置
+    - name: Checkout this repository
+      uses: actions/checkout@v4
+      with:
+        path: ${{ env.CUSTOM_CONFIG_DIR }}
+
+    # 第二步：安装所有系统依赖
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git curl wget python3 python3-pip python3-venv \
+          build-essential ninja-build cmake pkg-config \
+          clang lld llvm-dev bison flex libssl-dev zlib1g-dev \
+          libxml2-dev libedit-dev libncurses5-dev \
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+          yasm nasm zip unzip rsync
+
+    # 第三步：安装和配置 repo 工具
+    - name: Install Repo Tool
+      run: |
+        mkdir -p ~/bin
+        curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo “$(echo “$HOME”)/bin” >> $GITHUB_PATH
+
+    # 第四步：同步 Android LLVM 源码
+    - name: Download Android LLVM Source
+      timeout-minutes: 60
+      run: |
+        mkdir -p ${{ env.LLVM_SOURCE_ROOT }}
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        repo init -u https://android.googlesource.com/platform/manifest -b llvm-toolchain --depth=1
+        repo sync -c -j2 --no-tags --no-clone-bundle
+
+    # 第五步：应用你的自定义配置
+    - name: Apply Custom Configuration
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}/toolchain
+        rm -rf llvm_android
+        cp -r ${{ env.CUSTOM_CONFIG_DIR }} llvm_android
+        echo “Applied config. Key files:”
+        ls llvm_android/*.py | head -5
+
+    # 第六步：执行构建
+    - name: Run Build Script
+      timeout-minutes: 280
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}/toolchain/llvm_android
+        python3 -m venv .venv
+        source .venv/bin/activate
+        python3 build.py \
+          --no-build windows \
+          --skip-tests \
+          --single-stage \
+          --no-musl 2>&1 | tee build.log
+
+    # 第七步：验证并打包产物
+    - name: Verify and Package Output
+      if: success()
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        if [ ! -f out/stage2/bin/clang ]; then
+          echo “ERROR: Clang not found at out/stage2/bin/clang”
+          exit 1
+        fi
+        mkdir -p product/toolchains/llvm/prebuilt/linux-aarch64
+        cp -r out/stage2/* product/toolchains/llvm/prebuilt/linux-aarch64/
+        echo “Built from ${{ github.sha }} on $(date)” > product/README.md
+        tar czf ndk_aarch64.tar.gz product/
+
+    # 第八步：上传产物
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ndk-build-output
+        path: |
+          ${{ env.LLVM_SOURCE_ROOT }}/ndk_aarch64.tar.gz
+          ${{ env.LLVM_SOURCE_ROOT }}/toolchain/llvm_android/build.log
