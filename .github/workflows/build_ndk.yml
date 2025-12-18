@@ -1,0 +1,76 @@
+name: Build NDK for AArch64 Linux
+
+on:
+  workflow_dispatch:  # 此配置允许你手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      LLVM_SOURCE_ROOT: ${{ github.workspace }}/src
+      CUSTOM_CONFIG_DIR: ${{ github.workspace }}/my-config
+
+    steps:
+    # 1. 检出你仓库里的配置脚本
+    - name: Checkout this repo (Your config)
+      uses: actions/checkout@v4
+      with:
+        path: ${{ env.CUSTOM_CONFIG_DIR }}
+
+    # 2. 安装系统构建依赖
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git python3 python3-venv cmake ninja-build \
+          clang lld bison flex \
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+    # 3. 下载 Android 官方 LLVM 源码
+    - name: Get Android LLVM Source
+      run: |
+        mkdir -p ${{ env.LLVM_SOURCE_ROOT }}
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        repo init -u https://android.googlesource.com/platform/manifest -b llvm-toolchain --depth=1
+        repo sync -c -j4 --no-tags
+
+    # 4. 用你的配置替换官方的构建脚本
+    - name: Apply Custom Configuration
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}/toolchain
+        rm -rf llvm_android                  # 删除官方原版
+        cp -r ${{ env.CUSTOM_CONFIG_DIR }} llvm_android  # 替换为你的版本
+
+    # 5. 执行构建
+    - name: Run the Build
+      timeout-minutes: 300
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        python3 -m venv .venv
+        source .venv/bin/activate
+        cd toolchain/llvm_android
+        # 这是你项目中的核心命令
+        python3 build.py \
+          --no-build windows \
+          --skip-tests \
+          --single-stage \
+          --no-musl 2>&1 | tee build.log
+
+    # 6. 打包生成的工具链文件
+    - name: Package Output
+      if: success()
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        mkdir -p ndk_product/toolchains/llvm/prebuilt
+        # 假设构建输出在 out/stage2，并目标为 linux-aarch64
+        if [ -d out/stage2 ]; then
+          cp -r out/stage2 ndk_product/toolchains/llvm/prebuilt/linux-aarch64
+        fi
+        echo "Build from ${{ github.sha }}" > ndk_product/README.txt
+
+    # 7. 上传产物以供下载
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: aarch64-ndk
+        path: ${{ env.LLVM_SOURCE_ROOT }}/ndk_product/
