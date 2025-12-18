@@ -1,94 +1,698 @@
-name: Build NDK for AArch64 Linux Host
+name: 🔧 Build Android NDK for AArch64 Linux Host
 
 on:
   workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Target host triple (通常为 aarch64-linux-gnu)'
+        required: true
+        default: 'aarch64-linux-gnu'
+      skip_stage1:
+        description: '跳过 stage1 构建（如已有 bootstrap compiler）'
+        required: false
+        default: 'false'
+
+# 为整个工作流设置更长的超时时间（接近GitHub免费套餐6小时限制）
+env:
+  # ========== 核心路径配置 ==========
+  WORKSPACE: ${{ github.workspace }}
+  LLVM_SOURCE_ROOT: ${{ github.workspace }}/llvm_android_source
+  CUSTOM_CONFIG_DIR: ${{ github.workspace }}/custom_llvm_android_config
+  BUILD_OUTPUT_DIR: ${{ github.workspace }}/build_output
+  ARTIFACT_STAGING: ${{ github.workspace }}/artifacts
+  
+  # ========== 构建参数配置 ==========
+  TARGET_HOST: ${{ github.event.inputs.build_target || 'aarch64-linux-gnu' }}
+  BUILD_TYPE: 'Release'
+  PARALLEL_JOBS: 4  # 控制并行度以避免OOM
+  
+  # ========== 系统工具版本配置 ==========
+  CMAKE_VERSION: '3.29.0'
+  NINJA_VERSION: '1.11.1'
+  PYTHON_VERSION: '3.10'
+  
+  # ========== 镜像源配置（加速下载） ==========
+  PIP_INDEX_URL: 'https://pypi.tuna.tsinghua.edu.cn/simple'
+  UBUNTU_MIRROR: 'http://mirrors.aliyun.com/ubuntu/'
 
 jobs:
-  build:
+  # ========== 阶段一：准备完整构建环境 ==========
+  prepare-environment:
+    name: "🏗️ 准备完整构建环境"
     runs-on: ubuntu-22.04
-    timeout-minutes: 350
-
-    env:
-      LLVM_SOURCE_ROOT: ${{ github.workspace }}/llvm_src
-      CUSTOM_CONFIG_DIR: ${{ github.workspace }}/custom_config
-
+    timeout-minutes: 45
+    
     steps:
-    # 第一步：检出你的配置
-    - name: Checkout this repository
+    - name: "📦 检出自定义配置仓库"
       uses: actions/checkout@v4
       with:
         path: ${{ env.CUSTOM_CONFIG_DIR }}
-
-    # 第二步：安装所有系统依赖
-    - name: Install System Dependencies
+        fetch-depth: 0
+    
+    - name: "📝 环境信息诊断"
+      run: |
+        echo "=== 系统信息 ==="
+        uname -a
+        echo "=== 内存信息 ==="
+        free -h
+        echo "=== 磁盘信息 ==="
+        df -h
+        echo "=== CPU信息 ==="
+        lscpu | grep -E "^(CPU\(s\)|Thread|Core|Socket|Model name)"
+        echo "=== GitHub Runner 信息 ==="
+        echo "Runner OS: $RUNNER_OS"
+        echo "Runner Arch: $RUNNER_ARCH"
+        echo "=== 环境变量 ==="
+        echo "WORKSPACE: $WORKSPACE"
+        echo "TARGET_HOST: $TARGET_HOST"
+    
+    - name: "🔧 配置Ubuntu软件源（阿里云镜像）"
+      run: |
+        sudo sed -i "s|http://archive.ubuntu.com|${{ env.UBUNTU_MIRROR }}|g" /etc/apt/sources.list
+        sudo sed -i "s|http://security.ubuntu.com|${{ env.UBUNTU_MIRROR }}|g" /etc/apt/sources.list
+        sudo apt-get update --fix-missing
+    
+    - name: "📥 安装系统基础工具和库（第1部分：基础编译环境）"
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          git curl wget python3 python3-pip python3-venv \
-          build-essential ninja-build cmake pkg-config \
-          clang lld llvm-dev bison flex libssl-dev zlib1g-dev \
-          libxml2-dev libedit-dev libncurses5-dev \
-          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-          yasm nasm zip unzip rsync
-
-    # 第三步：安装和配置 repo 工具
-    - name: Install Repo Tool
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          software-properties-common apt-transport-https ca-certificates gnupg \
+          wget curl git subversion mercurial \
+          build-essential autoconf automake libtool pkg-config \
+          gettext texinfo flex bison gperf \
+          lsb-release sudo rsync jq
+    
+    - name: "📥 安装系统基础工具和库（第2部分：文件与压缩工具）"
       run: |
-        mkdir -p ~/bin
-        curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-        chmod a+x ~/bin/repo
-        echo “$(echo “$HOME”)/bin” >> $GITHUB_PATH
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          zip unzip zstd lz4 xz-utils liblzma-dev \
+          libarchive-dev libarchive-tools \
+          file tree ncdu pv
+    
+    - name: "📥 安装系统基础工具和库（第3部分：开发库）"
+      run: |
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          zlib1g-dev libbz2-dev liblzma-dev \
+          libssl-dev libssl3 openssl \
+          libxml2-dev libxml2-utils \
+          libncurses5-dev libncursesw5-dev \
+          libedit-dev libreadline-dev \
+          libffi-dev libgdbm-dev libsqlite3-dev \
+          libexpat1-dev libudev-dev \
+          libpcre2-dev libpcre3-dev \
+          libglib2.0-dev libpixman-1-dev \
+          libc6-dev libc6-dev-i386 lib32gcc-dev \
+          lib32stdc++6 gcc-multilib g++-multilib
+    
+    - name: "📥 安装系统基础工具和库（第4部分：语言运行时）"
+      run: |
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          python3 python3-dev python3-pip python3-venv python3-full \
+          python2 python2-dev \
+          perl ruby ruby-dev \
+          tcl tcl-dev tk tk-dev
+    
+    - name: "🐍 配置Python环境和pip镜像"
+      run: |
+        python3 -m pip install --upgrade pip setuptools wheel
+        python3 -m pip config set global.index-url ${{ env.PIP_INDEX_URL }}
+        # 安装构建可能需要的Python包
+        python3 -m pip install \
+          psutil \
+          colorama \
+          requests \
+          pyyaml \
+          jinja2
+    
+    - name: "🛠️ 安装高级构建工具（CMake从源码编译）"
+      run: |
+        cd /tmp
+        wget https://github.com/Kitware/CMake/releases/download/v${{ env.CMAKE_VERSION }}/cmake-${{ env.CMAKE_VERSION }}-linux-x86_64.tar.gz
+        tar -xzf cmake-${{ env.CMAKE_VERSION }}-linux-x86_64.tar.gz
+        sudo cp -r cmake-${{ env.CMAKE_VERSION }}-linux-x86_64/* /usr/local/
+        cmake --version
+    
+    - name: "🛠️ 安装Ninja构建系统"
+      run: |
+        cd /tmp
+        wget https://github.com/ninja-build/ninja/releases/download/v${{ env.NINJA_VERSION }}/ninja-linux.zip
+        unzip ninja-linux.zip
+        sudo install ninja /usr/local/bin/
+        ninja --version
+    
+    - name: "🎯 安装目标架构交叉编译工具链"
+      run: |
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          crossbuild-essential-arm64 \
+          gcc-${{ env.TARGET_HOST }} g++-${{ env.TARGET_HOST }} \
+          gcc-${{ env.TARGET_HOST }}-multilib g++-${{ env.TARGET_HOST }}-multilib \
+          binutils-${{ env.TARGET_HOST }} \
+          libc6-dev-${{ env.TARGET_HOST }}-cross \
+          libgcc-${{ env.TARGET_HOST }}-dev \
+          libstdc++-${{ env.TARGET_HOST }}-dev
+        
+        # 验证交叉编译器
+        ${{ env.TARGET_HOST }}-gcc --version
+        ${{ env.TARGET_HOST }}-g++ --version
+    
+    - name: "🔨 安装汇编器和低级工具"
+      run: |
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          yasm nasm \
+          xorriso mtools \
+          qemu-user-static binfmt-support \
+          llvm-dev libllvm-dev clang lld \
+          golang-go \
+          rustc cargo \
+          nodejs npm
+    
+    - name: "📁 安装Android repo工具"
+      run: |
+        sudo curl -s https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+        sudo chmod a+x /usr/local/bin/repo
+        echo "✅ repo工具已安装:"
+        repo --version
+    
+    - name: "📊 创建环境状态报告"
+      run: |
+        echo "=== 环境准备完成报告 ===" > ${{ env.WORKSPACE }}/environment_report.txt
+        echo "生成时间: $(date)" >> ${{ env.WORKSPACE }}/environment_report.txt
+        echo "" >> ${{ env.WORKSPACE }}/environment_report.txt
+        
+        echo "--- 关键工具版本 ---" >> ${{ env.WORKSPACE }}/environment_report.txt
+        gcc --version | head -1 >> ${{ env.WORKSPACE }}/environment_report.txt
+        g++ --version | head -1 >> ${{ env.WORKSPACE }}/environment_report.txt
+        ${{ env.TARGET_HOST }}-gcc --version | head -1 >> ${{ env.WORKSPACE }}/environment_report.txt
+        cmake --version | head -1 >> ${{ env.WORKSPACE }}/environment_report.txt
+        ninja --version >> ${{ env.WORKSPACE }}/environment_report.txt
+        python3 --version >> ${{ env.WORKSPACE }}/environment_report.txt
+        repo --version >> ${{ env.WORKSPACE }}/environment_report.txt
+        clang --version | head -1 >> ${{ env.WORKSPACE }}/environment_report.txt
+        lld --version | head -1 >> ${{ env.WORKSPACE }}/environment_report.txt
+        
+        echo "" >> ${{ env.WORKSPACE }}/environment_report.txt
+        echo "--- 磁盘使用情况 ---" >> ${{ env.WORKSPACE }}/environment_report.txt
+        df -h ${{ env.WORKSPACE }} >> ${{ env.WORKSPACE }}/environment_report.txt
+        
+        echo "✅ 环境报告已保存"
+        cat ${{ env.WORKSPACE }}/environment_report.txt
+    
+    outputs:
+      environment-ready: 'true'
+      target-host: ${{ env.TARGET_HOST }}
 
-    # 第四步：同步 Android LLVM 源码
-    - name: Download Android LLVM Source
-      timeout-minutes: 60
+  # ========== 阶段二：获取和准备源代码 ==========
+  fetch-and-prepare-source:
+    name: "📥 获取和准备源代码"
+    runs-on: ubuntu-22.04
+    needs: prepare-environment
+    timeout-minutes: 90
+    
+    steps:
+    - name: "📦 检出自定义配置"
+      uses: actions/checkout@v4
+      with:
+        path: ${{ env.CUSTOM_CONFIG_DIR }}
+    
+    - name: "📁 恢复工作区"
+      uses: actions/download-artifact@v4
+      with:
+        name: environment-report
+        path: ${{ env.WORKSPACE }}
+    
+    - name: "🌐 初始化Android LLVM代码仓库"
       run: |
         mkdir -p ${{ env.LLVM_SOURCE_ROOT }}
         cd ${{ env.LLVM_SOURCE_ROOT }}
-        repo init -u https://android.googlesource.com/platform/manifest -b llvm-toolchain --depth=1
-        repo sync -c -j2 --no-tags --no-clone-bundle
-
-    # 第五步：应用你的自定义配置
-    - name: Apply Custom Configuration
+        
+        echo "步骤1: 初始化repo仓库..."
+        repo init -u https://android.googlesource.com/platform/manifest \
+          -b llvm-toolchain \
+          --depth=1 \
+          --repo-rev=main \
+          --no-clone-bundle
+        
+        echo "步骤2: 配置git参数以优化大仓库克隆..."
+        git config --global user.email "builder@github.actions"
+        git config --global user.name "GitHub Actions Builder"
+        git config --global core.compression 0
+        git config --global core.loosecompression 0
+        git config --global pack.depth 1
+        git config --global pack.window 0
+        
+        echo "步骤3: 同步代码仓库（这一步耗时较长）..."
+        repo sync -c -j${{ env.PARALLEL_JOBS }} \
+          --no-tags \
+          --no-clone-bundle \
+          --optimized-fetch \
+          --prune
+        
+        echo "✅ 代码同步完成"
+        du -sh ${{ env.LLVM_SOURCE_ROOT }}
+    
+    - name: "🔧 应用自定义构建配置"
       run: |
-        cd ${{ env.LLVM_SOURCE_ROOT }}/toolchain
-        rm -rf llvm_android
-        cp -r ${{ env.CUSTOM_CONFIG_DIR }} llvm_android
-        echo “Applied config. Key files:”
-        ls llvm_android/*.py | head -5
-
-    # 第六步：执行构建
-    - name: Run Build Script
-      timeout-minutes: 280
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        
+        echo "备份原始toolchain/llvm_android目录..."
+        if [ -d toolchain/llvm_android ]; then
+          mv toolchain/llvm_android toolchain/llvm_android.google.backup
+          echo "原始配置已备份到: toolchain/llvm_android.google.backup"
+        fi
+        
+        echo "应用您的自定义配置..."
+        cp -r ${{ env.CUSTOM_CONFIG_DIR }} toolchain/llvm_android
+        
+        echo "验证配置替换结果..."
+        echo "自定义配置文件数量:"
+        find toolchain/llvm_android -name "*.py" -type f | wc -l
+        echo "关键构建脚本:"
+        ls -la toolchain/llvm_android/build.py
+        ls -la toolchain/llvm_android/configs.py
+        ls -la toolchain/llvm_android/hosts.py
+        
+        echo "检查目标主机配置..."
+        grep -r "${{ env.TARGET_HOST }}" toolchain/llvm_android/configs.py toolchain/llvm_android/hosts.py || true
+    
+    - name: "📋 生成源代码状态报告"
       run: |
-        cd ${{ env.LLVM_SOURCE_ROOT }}/toolchain/llvm_android
-        python3 -m venv .venv
-        source .venv/bin/activate
-        python3 build.py \
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        echo "=== 源代码状态报告 ===" > ${{ env.WORKSPACE }}/source_report.txt
+        echo "生成时间: $(date)" >> ${{ env.WORKSPACE }}/source_report.txt
+        echo "源码目录: ${{ env.LLVM_SOURCE_ROOT }}" >> ${{ env.WORKSPACE }}/source_report.txt
+        echo "" >> ${{ env.WORKSPACE }}/source_report.txt
+        
+        echo "--- 目录大小 ---" >> ${{ env.WORKSPACE }}/source_report.txt
+        du -sh . >> ${{ env.WORKSPACE }}/source_report.txt
+        echo "" >> ${{ env.WORKSPACE }}/source_report.txt
+        
+        echo "--- 关键目录结构 ---" >> ${{ env.WORKSPACE }}/source_report.txt
+        find . -maxdepth 3 -type d | sort | head -50 >> ${{ env.WORKSPACE }}/source_report.txt
+        
+        echo "✅ 源代码报告已生成"
+        cat ${{ env.WORKSPACE }}/source_report.txt | tail -30
+
+  # ========== 阶段三：执行完整构建 ==========
+  execute-build:
+    name: "🚀 执行完整构建"
+    runs-on: ubuntu-22.04
+    needs: fetch-and-prepare-source
+    timeout-minutes: 280
+    
+    steps:
+    - name: "📁 恢复工作区"
+      uses: actions/download-artifact@v4
+      with:
+        name: source-artifacts
+        path: ${{ env.WORKSPACE }}
+    
+    - name: "⚙️ 配置构建环境变量"
+      run: |
+        echo "=== 构建环境变量配置 ==="
+        echo "TARGET_HOST: ${{ env.TARGET_HOST }}"
+        echo "BUILD_TYPE: ${{ env.BUILD_TYPE }}"
+        echo "PARALLEL_JOBS: ${{ env.PARALLEL_JOBS }}"
+        echo "WORKSPACE: ${{ env.WORKSPACE }}"
+        
+        # 设置构建特定环境变量
+        export CC=clang
+        export CXX=clang++
+        export AR=llvm-ar
+        export RANLIB=llvm-ranlib
+        export LD=lld
+        
+        # 为构建过程设置必要的链接器标志
+        export LDFLAGS="-fuse-ld=lld -Wl,--gc-sections"
+        export CFLAGS="-O2 -pipe"
+        export CXXFLAGS="-O2 -pipe -stdlib=libc++"
+        
+        # 保存到环境文件供后续步骤使用
+        echo "CC=$CC" >> $GITHUB_ENV
+        echo "CXX=$CXX" >> $GITHUB_ENV
+        echo "AR=$AR" >> $GITHUB_ENV
+        echo "RANLIB=$RANLIB" >> $GITHUB_ENV
+        echo "LD=$LD" >> $GITHUB_ENV
+        echo "LDFLAGS=$LDFLAGS" >> $GITHUB_ENV
+        echo "CFLAGS=$CFLAGS" >> $GITHUB_ENV
+        echo "CXXFLAGS=$CXXFLAGS" >> $GITHUB_ENV
+    
+    - name: "🔍 预构建检查"
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        echo "=== 预构建系统检查 ==="
+        
+        echo "1. 检查关键工具..."
+        command -v cmake && cmake --version | head -1
+        command -v ninja && ninja --version
+        command -v python3 && python3 --version
+        command -v clang && clang --version | head -1
+        command -v ${{ env.TARGET_HOST }}-gcc && ${{ env.TARGET_HOST }}-gcc --version | head -1
+        
+        echo ""
+        echo "2. 检查磁盘空间..."
+        df -h ${{ env.WORKSPACE }}
+        
+        echo ""
+        echo "3. 检查内存..."
+        free -h
+        
+        echo ""
+        echo "4. 验证源代码目录..."
+        if [ -d toolchain/llvm_android ]; then
+          echo "✅ 自定义配置目录存在"
+          ls toolchain/llvm_android/*.py | wc -l
+        else
+          echo "❌ 自定义配置目录不存在"
+          exit 1
+        fi
+        
+        echo ""
+        echo "5. 检查构建脚本..."
+        if [ -f toolchain/llvm_android/build.py ]; then
+          echo "✅ 构建脚本存在"
+          python3 toolchain/llvm_android/build.py --help | head -10
+        else
+          echo "❌ 构建脚本不存在"
+          exit 1
+        fi
+    
+    - name: "🏗️ 执行第一阶段构建（Bootstrap）"
+      if: github.event.inputs.skip_stage1 != 'true'
+      timeout-minutes: 120
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        
+        echo "=== 开始第一阶段构建 ==="
+        echo "开始时间: $(date)"
+        echo "构建命令:"
+        echo "python3 toolchain/llvm_android/build.py \\"
+        echo "  --no-build windows \\"
+        echo "  --skip-tests \\"
+        echo "  --build-stage1-only \\"
+        echo "  --no-musl"
+        
+        # 创建构建日志目录
+        mkdir -p ${{ env.BUILD_OUTPUT_DIR }}/logs
+        
+        # 执行第一阶段构建，捕获详细输出
+        python3 toolchain/llvm_android/build.py \
+          --no-build windows \
+          --skip-tests \
+          --build-stage1-only \
+          --no-musl \
+          2>&1 | tee ${{ env.BUILD_OUTPUT_DIR }}/logs/stage1_build.log
+        
+        BUILD_EXIT_CODE=${PIPESTATUS[0]}
+        echo "第一阶段构建退出代码: $BUILD_EXIT_CODE"
+        
+        # 检查构建结果
+        if [ $BUILD_EXIT_CODE -eq 0 ]; then
+          echo "✅ 第一阶段构建成功完成"
+          echo "检查生成的文件..."
+          find out -name "clang" -type f -executable | head -5 | xargs file || true
+        else
+          echo "❌ 第一阶段构建失败"
+          echo "最后50行日志:"
+          tail -50 ${{ env.BUILD_OUTPUT_DIR }}/logs/stage1_build.log
+          exit $BUILD_EXIT_CODE
+        fi
+        
+        echo "第一阶段构建结束时间: $(date)"
+    
+    - name: "🏗️ 执行第二阶段构建（完整工具链）"
+      timeout-minutes: 180
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        
+        echo "=== 开始第二阶段构建 ==="
+        echo "开始时间: $(date)"
+        echo "构建命令:"
+        echo "python3 toolchain/llvm_android/build.py \\"
+        echo "  --no-build windows \\"
+        echo "  --skip-tests \\"
+        echo "  --single-stage \\"
+        echo "  --no-musl"
+        
+        # 执行第二阶段构建
+        python3 toolchain/llvm_android/build.py \
           --no-build windows \
           --skip-tests \
           --single-stage \
-          --no-musl 2>&1 | tee build.log
+          --no-musl \
+          2>&1 | tee ${{ env.BUILD_OUTPUT_DIR }}/logs/stage2_build.log
+        
+        BUILD_EXIT_CODE=${PIPESTATUS[0]}
+        echo "第二阶段构建退出代码: $BUILD_EXIT_CODE"
+        
+        # 验证构建产物
+        if [ $BUILD_EXIT_CODE -eq 0 ]; then
+          echo "✅ 第二阶段构建成功完成"
+          
+          echo "检查核心构建产物..."
+          if [ -f out/stage2/bin/clang ]; then
+            echo "✅ 找到clang编译器"
+            out/stage2/bin/clang --version | head -5
+          else
+            echo "❌ 未找到clang编译器"
+            find out -name "clang" -type f | head -10
+            exit 1
+          fi
+          
+          if [ -f out/stage2/bin/lld ]; then
+            echo "✅ 找到lld链接器"
+            out/stage2/bin/lld --version | head -3
+          fi
+          
+          if [ -d out/stage2/lib/clang ]; then
+            echo "✅ 找到Clang库文件"
+            ls out/stage2/lib/clang/*/include/ | head -5
+          fi
+          
+          # 检查目标架构支持
+          echo "检查目标架构支持..."
+          out/stage2/bin/clang -print-targets | grep -i "${{ env.TARGET_HOST }}" || true
+          
+        else
+          echo "❌ 第二阶段构建失败"
+          echo "最后100行日志:"
+          tail -100 ${{ env.BUILD_OUTPUT_DIR }}/logs/stage2_build.log
+          exit $BUILD_EXIT_CODE
+        fi
+        
+        echo "第二阶段构建结束时间: $(date)"
+        
+        # 生成构建摘要
+        echo "=== 构建产物统计 ===" > ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        echo "构建时间: $(date)" >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        echo "" >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        echo "--- 二进制文件 ---" >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        find out/stage2/bin -type f -executable | wc -l >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        echo "" >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        echo "--- 库文件 ---" >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        find out/stage2/lib -type f | wc -l >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        echo "" >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        echo "--- 总大小 ---" >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        du -sh out/stage2 >> ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+    
+    - name: "📊 生成构建报告"
+      run: |
+        echo "=== 构建完成报告 ==="
+        echo "总构建时间: 约$(( ($(date +%s) - $(cat ${{ env.BUILD_OUTPUT_DIR }}/logs/start_time.txt 2>/dev/null || echo $(date +%s)) ) / 60 )) 分钟"
+        echo ""
+        echo "构建产物位置: ${{ env.LLVM_SOURCE_ROOT }}/out/stage2"
+        echo "日志目录: ${{ env.BUILD_OUTPUT_DIR }}/logs"
+        
+        # 显示构建摘要
+        if [ -f ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt ]; then
+          echo ""
+          echo "构建摘要:"
+          cat ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        fi
 
-    # 第七步：验证并打包产物
-    - name: Verify and Package Output
-      if: success()
+  # ========== 阶段四：打包和发布产物 ==========
+  package-and-release:
+    name: "📦 打包和发布产物"
+    runs-on: ubuntu-22.04
+    needs: execute-build
+    timeout-minutes: 30
+    
+    steps:
+    - name: "📥 下载构建产物"
+      uses: actions/download-artifact@v4
+      with:
+        name: build-output
+        path: ${{ env.WORKSPACE }}
+    
+    - name: "🏷️ 确定产物目录结构"
       run: |
         cd ${{ env.LLVM_SOURCE_ROOT }}
-        if [ ! -f out/stage2/bin/clang ]; then
-          echo “ERROR: Clang not found at out/stage2/bin/clang”
+        
+        # 检查实际的构建输出目录结构
+        echo "=== 分析构建输出目录结构 ==="
+        find out -type d -name "*aarch64*" -o -name "*arm64*" | head -10
+        
+        # 基于常见模式确定目标目录名
+        if [ -d out/stage2 ]; then
+          if find out/stage2 -name "*aarch64*" | grep -q .; then
+            PREBUILT_DIR="linux-aarch64"
+          elif find out/stage2 -name "*arm64*" | grep -q .; then
+            PREBUILT_DIR="linux-arm64"
+          else
+            # 检查configs.py中的设置
+            CONFIG_DIR=$(grep -r "prebuilt.*dir\|host_tag" toolchain/llvm_android/configs.py 2>/dev/null | grep -o "linux-[a-z0-9_-]*" | head -1 || echo "linux-aarch64")
+            PREBUILT_DIR=$CONFIG_DIR
+          fi
+        else
+          PREBUILT_DIR="linux-aarch64"
+        fi
+        
+        echo "确定的目标目录: $PREBUILT_DIR"
+        echo "PREBUILT_DIR=$PREBUILT_DIR" >> $GITHUB_ENV
+        
+        # 创建完整的NDK目录结构
+        NDK_VERSION="r25c-custom-$(date +%Y%m%d)"
+        NDK_NAME="android-ndk-$NDK_VERSION"
+        echo "NDK_NAME=$NDK_NAME" >> $GITHUB_ENV
+        
+        mkdir -p ${{ env.ARTIFACT_STAGING }}/$NDK_NAME/toolchains/llvm/prebuilt/$PREBUILT_DIR
+    
+    - name: "📁 复制构建产物到NDK结构"
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        
+        echo "复制构建产物..."
+        if [ -d out/stage2 ]; then
+          cp -r out/stage2/* ${{ env.ARTIFACT_STAGING }}/${{ env.NDK_NAME }}/toolchains/llvm/prebuilt/${{ env.PREBUILT_DIR }}/
+          echo "✅ 构建产物复制完成"
+          
+          # 验证复制结果
+          echo "产物统计:"
+          find ${{ env.ARTIFACT_STAGING }}/${{ env.NDK_NAME }} -type f | wc -l
+          du -sh ${{ env.ARTIFACT_STAGING }}/${{ env.NDK_NAME }}
+        else
+          echo "❌ 错误: 未找到out/stage2目录"
+          find out -type d | head -20
           exit 1
         fi
-        mkdir -p product/toolchains/llvm/prebuilt/linux-aarch64
-        cp -r out/stage2/* product/toolchains/llvm/prebuilt/linux-aarch64/
-        echo “Built from ${{ github.sha }} on $(date)” > product/README.md
-        tar czf ndk_aarch64.tar.gz product/
+    
+    - name: "📄 创建NDK配置文件"
+      run: |
+        cd ${{ env.ARTIFACT_STAGING }}/${{ env.NDK_NAME }}
+        
+        # 创建RELEASE.TXT
+        cat > RELEASE.TXT << EOF
+基于Android NDK r25c构建的自定义工具链
+构建目标: ${{ env.TARGET_HOST }}
+构建时间: $(date -u)
+构建来源: ${{ github.repository }}
+提交哈希: ${{ github.sha }}
+预构建目录: ${{ env.PREBUILT_DIR }}
+构建参数: --single-stage --no-musl --skip-tests
+EOF
+        
+        # 创建简单的README
+        cat > README.md << EOF
+# 自定义AArch64 Linux主机NDK工具链
 
-    # 第八步：上传产物
-    - name: Upload Artifacts
+## 概述
+此工具链基于Android NDK r25c的LLVM代码构建，专门针对**${{ env.TARGET_HOST }}**主机系统。
+
+## 目录结构
+\`\`\`
+android-ndk-${{ env.NDK_VERSION }}/
+├── toolchains/
+│   └── llvm/
+│       └── prebuilt/
+│           └── ${{ env.PREBUILT_DIR }}/  # 工具链文件
+├── RELEASE.TXT
+└── README.md
+\`\`\`
+
+## 使用方法
+\`\`\`bash
+# 设置环境变量
+export NDK=\$(pwd)/android-ndk-${{ env.NDK_VERSION }}
+export PATH=\$NDK/toolchains/llvm/prebuilt/${{ env.PREBUILT_DIR }}/bin:\$PATH
+
+# 编译Android程序
+aarch64-linux-android33-clang your_source.c -o your_program
+\`\`\`
+
+## 验证
+\`\`\`bash
+# 检查编译器版本
+aarch64-linux-android33-clang --version
+
+# 编译测试程序
+echo 'int main() { return 0; }' > test.c
+aarch64-linux-android33-clang test.c -o test
+file test
+\`\`\`
+
+## 注意事项
+1. 此工具链需要在**aarch64架构的Linux系统**上运行
+2. 目标系统需要安装必要的运行库
+3. 这是自定义构建版本，非官方发布
+EOF
+        
+        echo "✅ 配置文件创建完成"
+    
+    - name: "📦 压缩打包产物"
+      run: |
+        cd ${{ env.ARTIFACT_STAGING }}
+        
+        echo "开始压缩打包..."
+        tar -czf ${{ env.NDK_NAME }}.tar.gz ${{ env.NDK_NAME }}
+        
+        echo "打包完成，文件信息:"
+        ls -lh ${{ env.NDK_NAME }}.tar.gz
+        
+        # 创建SHA256校验和
+        sha256sum ${{ env.NDK_NAME }}.tar.gz > ${{ env.NDK_NAME }}.tar.gz.sha256
+        
+        echo "✅ 打包完成"
+    
+    - name: "📤 上传构建产物"
       uses: actions/upload-artifact@v4
       with:
-        name: ndk-build-output
+        name: ndk-aarch64-linux-host
         path: |
-          ${{ env.LLVM_SOURCE_ROOT }}/ndk_aarch64.tar.gz
-          ${{ env.LLVM_SOURCE_ROOT }}/toolchain/llvm_android/build.log
+          ${{ env.ARTIFACT_STAGING }}/${{ env.NDK_NAME }}.tar.gz
+          ${{ env.ARTIFACT_STAGING }}/${{ env.NDK_NAME }}.tar.gz.sha256
+        retention-days: 14
+    
+    - name: "📋 上传构建日志"
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          ${{ env.BUILD_OUTPUT_DIR }}/logs/
+          ${{ env.BUILD_OUTPUT_DIR }}/build_summary.txt
+        retention-days: 14
+    
+    - name: "📊 生成最终报告"
+      run: |
+        echo "=== 构建流程完成报告 ===" > ${{ env.WORKSPACE }}/final_report.md
+        echo "" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "## 构建详情" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "- **仓库**: ${{ github.repository }}" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "- **提交**: ${{ github.sha }}" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "- **目标主机**: ${{ env.TARGET_HOST }}" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "- **构建时间**: $(date)" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "- **NDK版本**: ${{ env.NDK_NAME }}" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "- **预构建目录**: ${{ env.PREBUILT_DIR }}" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "## 产出物" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "1. **ndk-aarch64-linux-host**: 包含完整的NDK工具链" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "2. **build-logs**: 包含所有构建日志和摘要" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "## 使用说明" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "下载 \`ndk-aarch64-linux-host\` 产物后，解压并设置环境变量即可使用。" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "```bash" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "tar -xzf android-ndk-${{ env.NDK_VERSION }}.tar.gz" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "export NDK=\$(pwd)/android-ndk-${{ env.NDK_VERSION }}" >> ${{ env.WORKSPACE }}/final-report.md
+        echo "export PATH=\$NDK/toolchains/llvm/prebuilt/${{ env.PREBUILT_DIR }}/bin:\$PATH" >> ${{ env.WORKSPACE }}/final_report.md
+        echo "```" >> ${{ env.WORKSPACE }}/final_report.md
+        
+        cat ${{ env.WORKSPACE }}/final_report.md
