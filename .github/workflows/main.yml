@@ -1,0 +1,154 @@
+name: Build NDK for AArch64 Linux Host
+
+on:
+  workflow_dispatch:  # 仅手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04  # GitHub Actions 标准环境
+    timeout-minutes: 350   # 设置总超时，略小于6小时限制
+
+    env:
+      # 定义核心路径
+      LLVM_SOURCE_ROOT: ${{ github.workspace }}/llvm_src
+      CUSTOM_CONFIG_DIR: ${{ github.workspace }}/custom_config
+      # 优化：使用国内镜像加速 repo 和后续可能的大型下载（可选）
+      REPO_URL: 'https://mirrors.tuna.tsinghua.edu.cn/git/git-repo/'
+
+    steps:
+    # ========== 阶段一：准备环境与代码 ==========
+    - name: Checkout this repository (Your config)
+      uses: actions/checkout@v4
+      with:
+        path: ${{ env.CUSTOM_CONFIG_DIR }}
+
+    - name: Install All System Dependencies
+      run: |
+        sudo apt-get update
+        # 1. 基础工具 (git, curl, python, 编译器等)
+        sudo apt-get install -y git curl wget python3 python3-pip python3-venv
+        sudo apt-get install -y build-essential ninja-build cmake pkg-config
+        # 2. LLVM/Clang 构建依赖
+        sudo apt-get install -y clang lld llvm-dev bison flex libssl-dev zlib1g-dev
+        sudo apt-get install -y libxml2-dev libedit-dev libncurses5-dev swig
+        # 3. 目标为 aarch64-linux-gnu 的交叉编译工具链 (核心)
+        sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        sudo apt-get install -y binutils-aarch64-linux-gnu
+        # 4. 其他可能需要的工具 (如汇编器、打包工具)
+        sudo apt-get install -y yasm nasm zip unzip rsync
+        echo "✅ 所有系统依赖安装完成。"
+
+    - name: Install and Setup Repo Tool
+      run: |
+        mkdir -p ~/bin
+        curl -s ${{ env.REPO_URL }}/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        # 将 ~/bin 添加到 GitHub Actions 的 PATH 中
+        echo "$HOME/bin" >> $GITHUB_PATH
+        # 验证安装
+        ~/bin/repo --version
+        echo "✅ Repo 工具安装完成。"
+
+    # ========== 阶段二：获取与准备源码 ==========
+    - name: Download Android LLVM Source Code
+      timeout-minutes: 45  # 同步可能耗时，单独设置超时
+      run: |
+        mkdir -p ${{ env.LLVM_SOURCE_ROOT }}
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        echo "开始初始化仓库..."
+        ~/bin/repo init -u https://android.googlesource.com/platform/manifest \
+          -b llvm-toolchain \
+          --depth=1 \
+          --repo-rev=main
+        echo "开始同步代码 (使用 -j4 并行)..."
+        ~/bin/repo sync -c -j4 --no-tags --no-clone-bundle
+        echo "✅ 源码同步完成。"
+
+    - name: Apply Your Custom Build Configuration
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}/toolchain
+        echo "备份原版 llvm_android 目录..."
+        if [ -d llvm_android ]; then
+          mv llvm_android llvm_android.official_backup
+        fi
+        echo "应用您的自定义配置..."
+        cp -r ${{ env.CUSTOM_CONFIG_DIR }} llvm_android
+        echo "✅ 自定义配置替换完成。目标目录结构："
+        ls -la llvm_android/
+
+    # ========== 阶段三：执行构建 ==========
+    - name: Run the Build (Core Step)
+      timeout-minutes: 260  # 构建是最耗时的部分，分配约4.3小时
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}/toolchain/llvm_android
+        # 创建并激活独立的 Python 虚拟环境，避免污染系统环境
+        python3 -m venv build_venv
+        source build_venv/bin/activate
+        # 可选：安装构建脚本可能需要的 Python 包
+        # pip install -r requirements.txt 2>/dev/null || echo "无额外Python依赖"
+        
+        echo "=== 开始执行构建命令 ==="
+        echo "命令: python3 build.py --no-build windows --skip-tests --single-stage --no-musl"
+        echo "----------------------------------------"
+        # 执行构建，并实时输出日志，同时保存到文件
+        python3 build.py \
+          --no-build windows \
+          --skip-tests \
+          --single-stage \
+          --no-musl 2>&1 | tee build_output.log
+        echo "----------------------------------------"
+        
+        # 检查关键产出文件，验证构建是否成功
+        if [ -f ${{ env.LLVM_SOURCE_ROOT }}/out/stage2/bin/clang ]; then
+          echo "✅ 核心构建成功！生成的 Clang 信息："
+          ${{ env.LLVM_SOURCE_ROOT }}/out/stage2/bin/clang --version | head -5
+        else
+          echo "❌ 构建可能未产生核心输出。"
+          exit 1 # 如果找不到 clang，使步骤失败
+        fi
+
+    # ========== 阶段四：打包与上传 ==========
+    - name: Package the Built Toolchain
+      if: success() # 仅在构建成功时运行
+      run: |
+        cd ${{ env.LLVM_SOURCE_ROOT }}
+        PRODUCT_NAME="android-ndk-aarch64-host-$(date +%Y%m%d)"
+        mkdir -p $PRODUCT_NAME/toolchains/llvm/prebuilt
+        
+        # 假设你的配置将输出目标设置为 linux-aarch64
+        # 这是最关键的一行，决定了产物的目录结构
+        TARGET_HOST_DIR="linux-aarch64"
+        
+        echo "打包构建产物到目录: $TARGET_HOST_DIR"
+        if [ -d out/stage2 ]; then
+          cp -r out/stage2 $PRODUCT_NAME/toolchains/llvm/prebuilt/$TARGET_HOST_DIR
+        else
+          echo "错误：未找到构建输出目录 'out/stage2'"
+          exit 1
+        fi
+        
+        # 创建说明文件
+        cat > $PRODUCT_NAME/README << EOF
+自定义 AArch64 Linux 主机 NDK 工具链
+====================================
+- 构建来源: ${{ github.repository }}
+- 源码提交: ${{ github.sha }}
+- 构建日期: $(date -u)
+- 目标主机: aarch64-linux-gnu ($TARGET_HOST_DIR)
+- 构建命令: --single-stage --no-musl --skip-tests
+- 重要提示: 此工具链需在 aarch64 Linux 系统上运行。
+EOF
+        
+        # 压缩以便于下载
+        zip -rq $PRODUCT_NAME.zip $PRODUCT_NAME
+        echo "✅ 打包完成: $PRODUCT_NAME.zip"
+        ls -lh $PRODUCT_NAME.zip
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ndk-aarch64-linux-host-toolchain
+        path: |
+          ${{ env.LLVM_SOURCE_ROOT }}/*.zip
+          ${{ env.LLVM_SOURCE_ROOT }}/toolchain/llvm_android/build_output.log
+        retention-days: 7
